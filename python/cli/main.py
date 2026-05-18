@@ -274,7 +274,6 @@ def run_interactive(
 
 
 def run_serve(
-    engine: LLMEngine,
     config: ServingConfig,
     *,
     host: str = "0.0.0.0",
@@ -371,12 +370,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.serve:
             engine = create_engine(config)
             init_engine(engine, config)
-        else:
-            engine = None
 
     if args.serve:
         run_serve(
-            engine,
             config,
             host=args.host,
             port=args.port,

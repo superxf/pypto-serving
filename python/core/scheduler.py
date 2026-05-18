@@ -137,6 +137,15 @@ class Scheduler:
         self.waiting = deque(r for r in self.waiting if r.request_id != request_id)
         del self.requests[request_id]
 
+    def finish_request(self, request_id: str, status: RequestStatus) -> None:
+        """Mark a running request as finished and free its resources."""
+        request = self.requests.get(request_id)
+        if request is None:
+            return
+        request.status = status
+        self._free_request_blocks(request)
+        self.running = [r for r in self.running if r.request_id != request_id]
+
     def has_work(self) -> bool:
         return len(self.running) > 0 or len(self.waiting) > 0
 

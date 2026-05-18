@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -164,6 +165,8 @@ class AsyncLLMEngine:
         config,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer is required for request processing")
         prompt_token_ids = self.tokenizer.encode(prompt)
         if not prompt_token_ids and self.bos_token_id is not None:
             prompt_token_ids = [self.bos_token_id]
@@ -193,7 +196,9 @@ class AsyncLLMEngine:
                 if output.finished:
                     break
         finally:
-            self._request_contexts.pop(request_id, None)
+            if request_id in self._request_contexts:
+                self._request_contexts.pop(request_id, None)
+                self.scheduler.abort_request(request_id)
 
     async def abort_request(self, request_id: str) -> None:
         self.scheduler.abort_request(request_id)
@@ -226,9 +231,14 @@ class AsyncLLMEngine:
                 )
             )
 
-            step_output: StepOutput = await asyncio.to_thread(
-                self._output_queue.get, timeout=300
-            )
+            try:
+                step_output: StepOutput = await asyncio.to_thread(
+                    self._output_queue.get, timeout=300
+                )
+            except queue.Empty:
+                logger.error("Worker response timed out (300s)")
+                self._handle_step_error(scheduler_output)
+                continue
 
             if step_output.error:
                 logger.error(f"Worker returned error: {step_output.error}")
@@ -261,13 +271,9 @@ class AsyncLLMEngine:
                     if stop and text.endswith(stop):
                         req_output.finished = True
                         req_output.finish_reason = "FINISHED_STOP"
-                        ctx.request.status = RequestStatus.FINISHED_STOP
-                        self.scheduler._free_request_blocks(ctx.request)
-                        self.scheduler.running = [
-                            r
-                            for r in self.scheduler.running
-                            if r.request_id != req_output.request_id
-                        ]
+                        self.scheduler.finish_request(
+                            req_output.request_id, RequestStatus.FINISHED_STOP
+                        )
                         break
 
             if req_output.finished:
