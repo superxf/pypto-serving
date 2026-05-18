@@ -415,7 +415,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 if func.func_type in (FunctionType.Orchestration, FunctionType.Opaque):
                     chip_dir = lg_next_levels_dir / func.name
                     if chip_dir.exists():
-                        cc, lg_runtime_name = compile_and_assemble(
+                        cc, lg_runtime_name, _ = compile_and_assemble(
                             chip_dir, l3_generate.platform,
                         )
                         lg_chip_callables[func.name] = cc
@@ -523,7 +523,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             disabled_diagnostics=config.disabled_diagnostics,
             profiling=config.compile_profiling,
         )
-        chip_callable, runtime_name = compile_and_assemble(
+        chip_callable, runtime_name, _ = compile_and_assemble(
             work_dir,
             self._platform,
             pto_isa_commit=config.pto_isa_commit,
