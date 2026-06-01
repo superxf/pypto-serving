@@ -50,6 +50,7 @@ class NpuCliConfig:
     save_kernels_dir: str | None = None
     pypto_root: str | None = None
     l3_mode: bool = False
+    l3_dispatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
     parser.add_argument("--stream", action="store_true", help="Override generation.stream=true for this run.")
     parser.add_argument("--l3", action="store_true", help="Override npu.l3=true for this run.")
+    parser.add_argument("--l3-dispatch", action="store_true", help="Override npu.l3_dispatch=true for this run.")
     parser.add_argument(
         "--max-num-running-reqs",
         type=int,
@@ -116,6 +118,7 @@ def load_serving_config(
     *,
     stream_override: bool = False,
     l3_override: bool = False,
+    l3_dispatch_override: bool = False,
     device_override: int | None = None,
 ) -> ServingConfig:
     _ensure_core_imports()
@@ -156,6 +159,7 @@ def load_serving_config(
     )
 
     npu_l3_mode = l3_override or _get_bool_alias(npu_section, ("l3", "l3_mode"), False)
+    npu_l3_dispatch = l3_dispatch_override or _get_bool(npu_section, "l3_dispatch", False)
 
     page_size = _get_optional_int(runtime_section, "page_size")
     if page_size is None:
@@ -184,6 +188,7 @@ def load_serving_config(
         save_kernels_dir=_get_optional_str(npu_section, "save_kernels_dir"),
         pypto_root=_get_optional_str(npu_section, "pypto_root"),
         l3_mode=npu_l3_mode,
+        l3_dispatch=npu_l3_dispatch,
     )
 
     return ServingConfig(
@@ -208,6 +213,7 @@ def create_engine(config: ServingConfig) -> LLMEngine:
         device_id=config.npu.device_id,
         save_kernels_dir=config.npu.save_kernels_dir,
         l3_mode=config.npu.l3_mode,
+        l3_dispatch=config.npu.l3_dispatch,
     )
     return LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
 
@@ -379,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.config,
             stream_override=args.stream,
             l3_override=args.l3,
+            l3_dispatch_override=args.l3_dispatch,
             device_override=args.device,
         )
         if not args.serve:

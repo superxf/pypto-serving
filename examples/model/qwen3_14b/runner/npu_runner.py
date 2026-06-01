@@ -213,6 +213,144 @@ class Qwen314BModelRunner(ModelRunner):
             logits=logits_padded[:, : model.config.vocab_size],
         )
 
+    def run_prefill_l3(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        """Run the prefill kernel via an L3 Worker with orch-managed uploads."""
+        from simpler.task_interface import CallConfig, ContinuousTensor, TaskArgs, TensorArgType  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
+        from simpler_setup.torch_interop import make_tensor_arg, torch_dtype_to_datatype  # noqa: PLC0415
+
+        compiled = self._compiled
+        prefill_inputs = self._prepare_prefill_inputs(model, batch)
+        dw = compiled.decode_weights
+        t_prefill_start = time.perf_counter()
+
+        k_cache, v_cache = self.materialize_full_layer_cache(
+            model.config.model_id,
+        )
+        logits_padded = torch.zeros(
+            (prefill_inputs.actual_batch, compiled.padded_vocab),
+            dtype=torch.float32,
+        ).share_memory_()
+
+        # Ensure all tensors are in shared memory for L3 cross-process access.
+        hidden = self._share_cpu_tensor(prefill_inputs.hidden)
+        seq_lens = self._share_cpu_tensor(prefill_inputs.seq_lens)
+        block_table = self._share_cpu_tensor(prefill_inputs.block_table)
+        slot_mapping = self._share_cpu_tensor(prefill_inputs.slot_mapping)
+        k_cache = self._share_cpu_tensor(k_cache)
+        v_cache = self._share_cpu_tensor(v_cache)
+
+        static_weights = [
+            dw["decode_input_rms_weight"],
+            dw["decode_wq"],
+            dw["decode_wk"],
+            dw["decode_wv"],
+            dw["decode_q_norm_weight"],
+            dw["decode_k_norm_weight"],
+            compiled.rope_cos,
+            compiled.rope_sin,
+            dw["decode_wo"],
+            dw["decode_post_rms_weight"],
+            dw["decode_w_gate"],
+            dw["decode_w_up"],
+            dw["decode_w_down"],
+            compiled.final_norm_weight,
+            compiled.padded_lm_head_weight,
+        ]
+        for i, w in enumerate(static_weights):
+            static_weights[i] = self._share_cpu_tensor(w)
+
+        # KV sync-back bookkeeping: (host_ptr, dev_ptr, nbytes).
+        _kv_dev_ptrs: list[tuple[int, int, int]] = []
+
+        prefill_callable = compiled.prefill
+
+        def _orch_fn(orch, _args, _cfg):
+            call_config = CallConfig()
+            call_config.block_dim = prefill_callable.block_dim
+            call_config.aicpu_thread_num = prefill_callable.aicpu_thread_num
+
+            # Pre-upload static weights.
+            def _upload_static(t: torch.Tensor) -> ContinuousTensor:
+                nbytes = int(t.nbytes)
+                dev_ptr = orch.malloc(worker_id=0, size=nbytes)
+                orch.copy_to(worker_id=0, dst=dev_ptr, src=t.data_ptr(), size=nbytes)
+                shapes = tuple(int(s) for s in t.shape)
+                dt = torch_dtype_to_datatype(t.dtype)
+                return ContinuousTensor.make(dev_ptr, shapes, dt, child_memory=True)
+
+            # Pre-upload KV cache (will sync back after run).
+            def _upload_kv(t: torch.Tensor) -> ContinuousTensor:
+                nbytes = int(t.nbytes)
+                dev_ptr = orch.malloc(worker_id=0, size=nbytes)
+                orch.copy_to(worker_id=0, dst=dev_ptr, src=t.data_ptr(), size=nbytes)
+                _kv_dev_ptrs.append((t.data_ptr(), dev_ptr, nbytes))
+                shapes = tuple(int(s) for s in t.shape)
+                dt = torch_dtype_to_datatype(t.dtype)
+                return ContinuousTensor.make(dev_ptr, shapes, dt, child_memory=True)
+
+            sw_devs = [_upload_static(w) for w in static_weights]
+            k_dev = _upload_kv(k_cache)
+            v_dev = _upload_kv(v_cache)
+
+            # Build TaskArgs in prefill_fwd parameter order.
+            a = TaskArgs()
+            a.add_tensor(make_tensor_arg(hidden), TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(seq_lens), TensorArgType.INPUT)
+            # static weights: input_rms, wq, wk, wv, q_norm, k_norm, rope_cos, rope_sin
+            for dev_t in sw_devs[:8]:
+                a.add_tensor(dev_t, TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(slot_mapping), TensorArgType.INPUT)
+            a.add_tensor(k_dev, TensorArgType.INPUT)
+            a.add_tensor(v_dev, TensorArgType.INPUT)
+            # static weights: wo, post_rms, w_gate, w_up, w_down, final_norm, lm_head
+            for dev_t in sw_devs[8:]:
+                a.add_tensor(dev_t, TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(logits_padded), TensorArgType.OUTPUT)
+
+            orch.submit_next_level(chip_cid, a, call_config, worker=0)
+
+        # Create L3 Worker, register, init, run.
+        worker = Worker(
+            level=3,
+            device_ids=[self._device_id],
+            num_sub_workers=0,
+            platform=self._platform,
+            runtime=prefill_callable.runtime_name,
+        )
+        chip_cid = worker.register(prefill_callable.chip_callable)
+        worker.init()
+
+        try:
+            worker.run(_orch_fn)
+
+            # Sync KV cache back to host.
+            if _kv_dev_ptrs:
+                def _kv_sync_fn(orch, _args, _cfg):
+                    for host_ptr, dev_ptr, nbytes in _kv_dev_ptrs:
+                        orch.copy_from(worker_id=0, dst=host_ptr, src=dev_ptr, size=nbytes)
+                worker.run(_kv_sync_fn)
+        finally:
+            worker.close()
+
+        self._l2_dirty_kv_models.add(model.config.model_id)
+
+        if _TIMING_ENABLED:
+            print(
+                f"[timing] prefill_l3: fused {len(model.layers)} layers, "
+                f"{(time.perf_counter() - t_prefill_start) * 1000:.2f} ms",
+                flush=True,
+            )
+
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            alloc.tokens_used = max(alloc.tokens_used, seq_len)
+        return PrefillResult(
+            last_hidden=None,
+            logits=logits_padded[:, : model.config.vocab_size],
+        )
+
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run the JIT all-layer decode kernel and return next-token logits."""
         compiled = self._compiled
@@ -257,6 +395,147 @@ class Qwen314BModelRunner(ModelRunner):
             logits_padded,
         )
         self._l2_dirty_kv_models.discard(model.config.model_id)
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+        return DecodeResult(
+            hidden_states=hidden.float(),
+            logits=logits_padded[:, : model.config.vocab_size].to(hidden.device),
+        )
+
+    def run_decode_l3(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        """Run the decode kernel via an L3 Worker with orch-managed uploads."""
+        from simpler.task_interface import CallConfig, ContinuousTensor, TaskArgs, TensorArgType  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
+        from simpler_setup.torch_interop import make_tensor_arg, torch_dtype_to_datatype  # noqa: PLC0415
+
+        compiled = self._compiled
+        decode_inputs = self._prepare_decode_inputs(model, batch)
+        hidden = decode_inputs.hidden
+        dw = compiled.decode_weights
+
+        k_cache, v_cache = self.materialize_full_layer_cache(
+            model.config.model_id,
+        )
+        t_decode_start = time.perf_counter()
+
+        logits_padded = torch.zeros(
+            (decode_inputs.actual_batch, compiled.padded_vocab),
+            dtype=torch.float32,
+        ).share_memory_()
+
+        # Ensure all tensors are in shared memory for L3 cross-process access.
+        hidden = self._share_cpu_tensor(hidden)
+        seq_lens = self._share_cpu_tensor(decode_inputs.seq_lens)
+        block_table = self._share_cpu_tensor(decode_inputs.block_table)
+        slot_mapping = self._share_cpu_tensor(decode_inputs.slot_mapping)
+        k_cache = self._share_cpu_tensor(k_cache)
+        v_cache = self._share_cpu_tensor(v_cache)
+
+        static_weights = [
+            dw["decode_input_rms_weight"],
+            dw["decode_wq"],
+            dw["decode_wk"],
+            dw["decode_wv"],
+            dw["decode_q_norm_weight"],
+            dw["decode_k_norm_weight"],
+            compiled.rope_cos,
+            compiled.rope_sin,
+            dw["decode_wo"],
+            dw["decode_post_rms_weight"],
+            dw["decode_w_gate"],
+            dw["decode_w_up"],
+            dw["decode_w_down"],
+            compiled.final_norm_weight,
+            compiled.padded_lm_head_weight,
+        ]
+        for i, w in enumerate(static_weights):
+            static_weights[i] = self._share_cpu_tensor(w)
+
+        _kv_dev_ptrs: list[tuple[int, int, int]] = []
+
+        decode_callable = compiled.decode
+
+        def _orch_fn(orch, _args, _cfg):
+            call_config = CallConfig()
+            call_config.block_dim = decode_callable.block_dim
+            call_config.aicpu_thread_num = decode_callable.aicpu_thread_num
+
+            def _upload_static(t: torch.Tensor) -> ContinuousTensor:
+                nbytes = int(t.nbytes)
+                dev_ptr = orch.malloc(worker_id=0, size=nbytes)
+                orch.copy_to(worker_id=0, dst=dev_ptr, src=t.data_ptr(), size=nbytes)
+                shapes = tuple(int(s) for s in t.shape)
+                dt = torch_dtype_to_datatype(t.dtype)
+                return ContinuousTensor.make(dev_ptr, shapes, dt, child_memory=True)
+
+            def _upload_kv(t: torch.Tensor) -> ContinuousTensor:
+                nbytes = int(t.nbytes)
+                dev_ptr = orch.malloc(worker_id=0, size=nbytes)
+                orch.copy_to(worker_id=0, dst=dev_ptr, src=t.data_ptr(), size=nbytes)
+                _kv_dev_ptrs.append((t.data_ptr(), dev_ptr, nbytes))
+                shapes = tuple(int(s) for s in t.shape)
+                dt = torch_dtype_to_datatype(t.dtype)
+                return ContinuousTensor.make(dev_ptr, shapes, dt, child_memory=True)
+
+            sw_devs = [_upload_static(w) for w in static_weights]
+            k_dev = _upload_kv(k_cache)
+            v_dev = _upload_kv(v_cache)
+
+            # Build TaskArgs in decode_fwd parameter order:
+            # hidden, input_rms, wq, wk, wv, q_norm, k_norm,
+            # seq_lens, block_table, slot_mapping,
+            # rope_cos, rope_sin, k_cache, v_cache,
+            # wo, post_rms, w_gate, w_up, w_down, final_norm, lm_head, out
+            a = TaskArgs()
+            a.add_tensor(make_tensor_arg(hidden), TensorArgType.INPUT)
+            # static weights: input_rms, wq, wk, wv, q_norm, k_norm
+            for dev_t in sw_devs[:6]:
+                a.add_tensor(dev_t, TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(seq_lens), TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(slot_mapping), TensorArgType.INPUT)
+            # static weights: rope_cos, rope_sin
+            for dev_t in sw_devs[6:8]:
+                a.add_tensor(dev_t, TensorArgType.INPUT)
+            a.add_tensor(k_dev, TensorArgType.INPUT)
+            a.add_tensor(v_dev, TensorArgType.INPUT)
+            # static weights: wo, post_rms, w_gate, w_up, w_down, final_norm, lm_head
+            for dev_t in sw_devs[8:]:
+                a.add_tensor(dev_t, TensorArgType.INPUT)
+            a.add_tensor(make_tensor_arg(logits_padded), TensorArgType.OUTPUT)
+
+            orch.submit_next_level(chip_cid, a, call_config, worker=0)
+
+        worker = Worker(
+            level=3,
+            device_ids=[self._device_id],
+            num_sub_workers=0,
+            platform=self._platform,
+            runtime=decode_callable.runtime_name,
+        )
+        chip_cid = worker.register(decode_callable.chip_callable)
+        worker.init()
+
+        try:
+            worker.run(_orch_fn)
+
+            if _kv_dev_ptrs:
+                def _kv_sync_fn(orch, _args, _cfg):
+                    for host_ptr, dev_ptr, nbytes in _kv_dev_ptrs:
+                        orch.copy_from(worker_id=0, dst=host_ptr, src=dev_ptr, size=nbytes)
+                worker.run(_kv_sync_fn)
+        finally:
+            worker.close()
+
+        self._l2_dirty_kv_models.discard(model.config.model_id)
+
+        if _TIMING_ENABLED:
+            print(
+                f"[timing] decode_l3: fused {len(model.layers)} layers, "
+                f"{(time.perf_counter() - t_decode_start) * 1000:.2f} ms",
+                flush=True,
+            )
+
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(

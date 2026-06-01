@@ -23,10 +23,13 @@ try:
     from python.core.model_runner import ModelRunner
     from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
     from python.core.types import (
+        DecodeBatch,
+        DecodeResult,
         GenerateConfig,
         GenerateResult,
         ModelRecord,
         PrefillBatch,
+        PrefillResult,
         RequestState,
         RuntimeModel,
     )
@@ -42,10 +45,13 @@ except ImportError:
     from python.core.model_runner import ModelRunner
     from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
     from python.core.types import (
+        DecodeBatch,
+        DecodeResult,
         GenerateConfig,
         GenerateResult,
         ModelRecord,
         PrefillBatch,
+        PrefillResult,
         RequestState,
         RuntimeModel,
     )
@@ -170,6 +176,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         device_id: int = 0,
         save_kernels_dir: str | None = None,
         l3_mode: bool = False,
+        l3_dispatch: bool = False,
         l3_trace: bool = False,
     ) -> None:
         super().__init__(
@@ -179,6 +186,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             save_kernels_dir=save_kernels_dir,
         )
         self._l3_mode = l3_mode
+        self._l3_dispatch = l3_dispatch
         self._l3_trace = l3_trace
         self._l2_compile_root: Path | None = None
 
@@ -302,6 +310,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             max_new_tokens,
             eos_token_id,
         )
+
+    def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        """Route prefill to L3 or L2 based on l3_dispatch."""
+        runner = self._runners[model.config.model_id]
+        if not isinstance(runner, Qwen314BModelRunner):
+            raise TypeError("Qwen314BPyptoExecutor requires a Qwen314BModelRunner.")
+        if self._l3_dispatch:
+            return runner.run_prefill_l3(model, batch)
+        return runner.run_prefill(model, batch)
+
+    def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        """Route decode to L3 or L2 based on l3_dispatch."""
+        runner = self._runners[model.config.model_id]
+        if not isinstance(runner, Qwen314BModelRunner):
+            raise TypeError("Qwen314BPyptoExecutor requires a Qwen314BModelRunner.")
+        if self._l3_dispatch:
+            return runner.run_decode_l3(model, batch)
+        return runner.run_decode(model, batch)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""

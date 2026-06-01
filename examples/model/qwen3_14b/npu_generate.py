@@ -326,6 +326,14 @@ def build_parser() -> argparse.ArgumentParser:
              "generate call.",
     )
     parser.add_argument(
+        "--l3-dispatch",
+        action="store_true",
+        dest="l3_dispatch",
+        help="Enable L3 dispatch: prefill and decode each run via a separate "
+             "L3 Worker with orch-managed weight/KV uploads (child_memory). "
+             "Unlike --l3, the engine still drives the prefill→decode loop.",
+    )
+    parser.add_argument(
         "--num-layers-override",
         type=int,
         default=None,
@@ -364,6 +372,7 @@ def main() -> None:
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,
         l3_mode=args.l3_mode,
+        l3_dispatch=args.l3_dispatch,
         l3_trace=args.profile_verbose,
     )
     engine = LLMEngine(
