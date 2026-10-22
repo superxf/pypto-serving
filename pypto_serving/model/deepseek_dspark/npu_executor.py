@@ -9,8 +9,8 @@
 """PyPTO executor for the DSpark DeepSeek-V4-Flash target kernels.
 
 Compiles ``l3_prefill_fwd`` and ``l3_decode_fwd`` from
-``pypto-lib/models/deepseek_v4_flash_dspark`` with the canonical 16-card
-import contract (``--tp 4 --ep 16 --weight-bank-size 43``) and hands the
+``pypto-lib/models/deepseek_v4_flash_dspark`` with a 16-card
+import contract (``--tp 1|4 --ep 16 --lm-head-tp 4 --weight-bank-size 43``) and hands the
 compiled programs to :class:`DSparkModelRunner`.  The DSpark kernels freeze
 their shapes from ``sys.argv`` at import, so every import runs inside
 ``_dspark_import_context``; the module names collide with the MTP variant's
@@ -26,6 +26,7 @@ import importlib
 import os
 import sys
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -37,9 +38,11 @@ from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_FWD_NUM_LAYERS,
+    DSPARK_LM_HEAD_TP_SIZE,
     DSPARK_NOISE_TOKEN_ID,
     DSPARK_RANKS,
     DSPARK_SPECULATIVE_TOKENS,
+    DSPARK_TP_SIZE,
     DSparkCacheLayout,
     DSparkCompiledKernels,
     DSparkRopeTables,
@@ -149,8 +152,9 @@ def _dspark_import_context(
     ep: int,
     weight_bank_size: int,
     dp: int = 1,
+    lm_head_tp: int = 4,
 ):
-    """Import DSpark kernels with the canonical 16-card shape arguments."""
+    """Import DSpark kernels with the selected target and LM-head parallel axes."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
     missing = object()
@@ -167,11 +171,10 @@ def _dspark_import_context(
         "pypto-serving-dspark",
         "--tp", str(int(tp)),
         "--ep", str(int(ep)),
-        # lm_head.WORLD_SIZE = TP * DP scopes the markov sampler's stacked
-        # tensors; only lm_head/dspark_markov parse --dp (the target programs
-        # ignore it), so passing the DP group count makes the markov program
-        # cover the full 16-rank world in one dispatch.
+        # --ep defines the composed world; --dp also configures standalone
+        # LM-head and Markov fixtures imported in the same context.
         "--dp", str(int(dp)),
+        "--lm-head-tp", str(int(lm_head_tp)),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
     sys.path.insert(0, str(kernel_dir))
@@ -206,6 +209,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         device_ids: Sequence[int] | None = None,
         pypto_build_dir: str | None = None,
         cache_ranks: int = DSPARK_RANKS,
+        tp_size: int = DSPARK_TP_SIZE,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
@@ -222,7 +226,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # The serving topology is flag-driven: --ep is the rank count and this
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
-        self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks, tp_size=tp_size)
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -324,15 +328,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise ValueError(
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
-        layout = DSparkCacheLayout(
-            ranks=self._topology_layout.ranks,
-            partitions=self._topology_layout.partitions,
-            prefill_batch=min(
-                model.runtime.max_batch_size, self._topology_layout.prefill_batch
-            ),
-            prefill_requests=min(
-                model.runtime.max_batch_size, self._topology_layout.prefill_requests
-            ),
+        layout = replace(
+            self._topology_layout,
+            prefill_batch=min(model.runtime.max_batch_size, self._topology_layout.prefill_batch),
+            prefill_requests=min(model.runtime.max_batch_size, self._topology_layout.prefill_requests),
         )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
@@ -543,6 +542,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             ep=layout.ranks,
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
             dp=layout.partitions,
+            lm_head_tp=DSPARK_LM_HEAD_TP_SIZE,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")

@@ -10,6 +10,7 @@
 
 import ast
 import ctypes
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,7 +34,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 
 
-def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
+def _runner(*, speculative: bool = False, max_position: int = 512, tp_size: int = 4) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -47,9 +48,10 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
         ratio128_half_sin=rows[:, :32] + 7,
     )
     # Keep the production topology but shrink prefill's token and hidden axes.
-    layout = DSparkCacheLayout(
+    layout = replace(
+        DSparkCacheLayout.for_ranks(16, tp_size=tp_size),
         prefill_tokens=128,
-        prefill_local_tokens=32,
+        prefill_local_tokens=128 // tp_size,
         prefill_requests=2,
         hidden_size=4,
     )
@@ -86,7 +88,7 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
 
         ranks = layout.ranks
         for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
-            group_extent = 4 * extent
+            group_extent = tp_size * extent
             runner._drafter_context_staging[extent] = {
                 "context_group_position_ids": torch.zeros(
                     (ranks, group_extent), dtype=torch.int32
@@ -107,6 +109,148 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
                 dtype=torch.int32,
             )
     return runner
+
+
+def test_tp1_dp16_layout_matches_kernel_axes():
+    from pypto_serving.model.deepseek_dspark.task_args import _decode_slots, decode_scratch_specs
+
+    layout = DSparkCacheLayout.for_ranks(16, tp_size=1)
+    assert (layout.partitions, layout.decode_local_batch, layout.decode_local_tokens) == (16, 16, 128)
+    assert (layout.moe_tokens, layout.max_logit_rows, layout.prefill_local_tokens) == (128, 128, 8192)
+    assert (layout.prefill_batch, layout.prefill_requests) == (256, 16)
+    assert _decode_slots(layout)["input_ids"][1] == (16, 128)
+    assert _decode_slots(layout)["grammar_mask"][1][1] == 128
+    assert decode_scratch_specs(layout)["x_moe_next"][0] == (16, 128, 4, 4096)
+
+
+def test_tp1_output_projection_weights_are_replicated():
+    from pypto_serving.model.deepseek_dspark.weight_spec import DSParkShardPolicy
+
+    source = torch.arange(8 * 2 * 3, dtype=torch.float32).reshape(8, 2, 3)
+    packed = DSParkShardPolicy(16, tp_size=1).apply(
+        "wo_a", source, dtype=torch.bfloat16, destination=None
+    )
+    assert packed.shape == (16, 8, 2, 3)
+    assert torch.equal(packed[0], packed[15])
+    assert torch.equal(packed[0], source.to(torch.bfloat16))
+
+
+def test_tp1_kernel_import_keeps_lm_head_tp4():
+    executor = DeepSeekV4DSparkPyptoExecutor.__new__(DeepSeekV4DSparkPyptoExecutor)
+    executor._kernel_dir = executor_module._find_pypto_lib_dspark_dir()
+    modules = executor._load_kernel_modules(DSparkCacheLayout.for_ranks(16, tp_size=1), speculative=True)
+
+    for name in ("decode_fwd", "prefill_fwd", "decode_fwd_dspark"):
+        assert modules[name].TP_SIZE == 1
+        assert modules[name].LM_HEAD_TP_SIZE == 4
+        assert modules[name].N_RANKS == 16
+        assert modules[name].MAX_LOGIT_ROWS == 128
+    assert modules["dspark_drafter"].TP_SIZE == 1
+
+
+def test_tp1_decode_rejects_more_than_sixteen_requests_in_one_partition():
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._compiled = SimpleNamespace(
+        layout=DSparkCacheLayout.for_ranks(16, tp_size=1), num_speculative_tokens=0
+    )
+    batch = DecodeBatch(
+        request_ids=[str(index) for index in range(17)],
+        token_ids=torch.zeros(17, dtype=torch.int64),
+        hidden_states=None,
+        seq_lens=torch.ones(17, dtype=torch.int32),
+        cache_partitions=[0] * 17,
+    )
+    with pytest.raises(ValueError, match="local capacity 16"):
+        runner._decode_assignment(batch)
+
+
+def test_tp1_decode_plan_keeps_kernel_table_backing():
+    runner = _runner()
+    runner._compiled.layout = replace(runner._compiled.layout, ranks=1, tp_size=1, partitions=1)
+    batch = DecodeBatch(
+        request_ids=["request"],
+        token_ids=torch.tensor([10]),
+        hidden_states=None,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_ids_by_group=_block_rows(1),
+        cache_partitions=[0],
+    )
+    plan = runner._prepare_decode_plan(batch, buffer_slot=0)
+    assert len(plan.group_plans[0].request_indices) == 64
+    assert plan.group_ori_block_tables.shape[1] == 64
+    assert plan.group_plans[0].request_indices[0] == 0
+    assert all(index is None for index in plan.group_plans[0].request_indices[1:])
+
+
+def test_tp1_decode_plan_keeps_unallocated_rolling_state_pages():
+    runner = _runner(speculative=True, tp_size=1)
+    blocks = _block_rows(1)[0]
+    blocks["csa_state"] = [-1, 1]
+    blocks["csa_inner_state"] = [-1, 2]
+    batch = DecodeBatch(
+        request_ids=["request"],
+        token_ids=torch.tensor([10]),
+        hidden_states=None,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_ids_by_group=[blocks],
+        cache_partitions=[0],
+    )
+    runner._reserve_drafter_state("request", group=0, prompt_len=1)
+    plan = runner._prepare_decode_plan(batch, buffer_slot=0)
+    assert plan.group_csa_state_block_tables[0, 0, :4].tolist() == [-1, 1, -1, 1]
+    assert plan.group_csa_inner_state_block_tables[0, 0, :4].tolist() == [-1, 2, -1, 2]
+
+
+def test_tp1_decode_staging_uses_physical_group_width():
+    runner = _runner()
+    runner._compiled.layout = replace(runner._compiled.layout, tp_size=1, partitions=16)
+    batch = DecodeBatch(
+        request_ids=["request"],
+        token_ids=torch.tensor([10]),
+        hidden_states=None,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_ids_by_group=_block_rows(1),
+        cache_partitions=[0],
+    )
+    plan = runner._prepare_decode_plan(batch, buffer_slot=0)
+    prepared = runner.prepare_decode_inputs(SimpleNamespace(), batch, buffer_slot=0, plan=plan)
+    assert prepared.groups == (0,)
+    assert runner._decode_task_args[0].tensors["position_ids"].shape == (16, 512)
+
+
+def test_tp1_drafter_staging_matches_group_axes():
+    runner = _runner(speculative=True, tp_size=1)
+    layout = runner._compiled.layout
+    slots = task_args_module._drafter_slots(layout)
+    bootstrap = task_args_module.bootstrap_metadata_specs(layout)
+    assert slots["query_group_position_ids"][1] == (16, 112)
+    assert bootstrap["query_group_position_ids"][0] == (16, 112)
+    assert layout.bootstrap_context_rows == 512
+    assert bootstrap["context_group_position_ids"][0] == (16, 512)
+
+    rows_by_rank = [[] for _ in range(layout.ranks)]
+    rows_by_rank[0].append(
+        DSparkDrafterRequestRow(
+            request_id="request", group=0, lease=0, anchor=100,
+            valid_count=1, token_source=10, hidden_row=0, decode_mode=True,
+        )
+    )
+    batch, context_rows = runner._prepare_drafter_inputs(
+        rows_by_rank, hidden=None, context_rows=32
+    )
+    assert (batch, context_rows) == (4, 32)
+    assert runner._drafter_context_staging[32]["context_group_position_ids"].shape == (16, 32)
+    assert runner._drafter_task_args.tensors["query_group_position_ids"][0, :7].tolist() == [
+        101, 102, 103, 104, 105, 106, 107
+    ]
+
+    marker = object()
+    runner._compiled.bootstrap_metadata = object()
+    runner._device_scratch[("bootstrap_meta", "context_group_position_ids")] = marker
+    runner._drafter_task_args = SimpleNamespace(
+        names=("context_group_position_ids",), build=lambda: (None,)
+    )
+    assert runner._drafter_dispatch_args(4, 512, bootstrap=True) == (marker,)
 
 
 def _block_rows(count: int) -> list[dict[str, list[int]]]:

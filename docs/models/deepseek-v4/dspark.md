@@ -1,10 +1,10 @@
 # DeepSeek V4 DSpark Deployment
 
-DSpark serves the converted DeepSeek V4 Flash W8A8 checkpoint with TP4 groups. It supports target-only greedy decoding (`K=0`) and a seven-token speculative chain (`K=7`). The 16-device configuration below uses `--dp 4 --ep 16 --tp 4`; an eight-device configuration uses `--dp 2 --ep 8 --tp 4`. Each configuration needs exactly as many device IDs as its `--ep` value.
+DSpark serves the converted DeepSeek V4 Flash W8A8 checkpoint. It supports target-only greedy decoding (`K=0`) and a seven-token speculative chain (`K=7`). The 16-device configuration below uses `--dp 16 --ep 16 --tp 1` for one target-model replica per device. The existing `--dp 4 --ep 16 --tp 4` and eight-device `--dp 2 --ep 8 --tp 4` configurations are also supported. The LM head remains TP4 in TP1 deployments. Each configuration needs exactly as many device IDs as its `--ep` value.
 
 ## Prepare the Checkpoint
 
-Use the same [checkpoint conversion](mtp.md#checkpoint-conversion) as the eight-device MTP path. Set `--block-size 32` for DSpark. The CLI validates the topology and caps `--max-num-seqs` at 64 requests per TP group (256 on 16 devices, 128 on eight). `--max-model-len` cannot exceed 1,048,576 or the checkpoint's `max_position_embeddings`. DSpark currently supports greedy sampling only, so use `temperature: 0`.
+Use the same [checkpoint conversion](mtp.md#checkpoint-conversion) as the eight-device MTP path. Set `--block-size 32` for DSpark. The CLI validates the topology and caps `--max-num-seqs` at 16 requests per rank (256 on 16 devices, 128 on eight). `--max-model-len` cannot exceed 1,048,576 or the checkpoint's `max_position_embeddings`. DSpark currently supports greedy sampling only, so use `temperature: 0`.
 
 ## Start the Server
 
@@ -14,7 +14,7 @@ pypto-serving \
   --served-model-name dsv4-flash-w8a8 \
   --platform a2a3 \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --dp 4 --ep 16 --tp 4 \
+  --dp 16 --ep 16 --tp 1 \
   --block-size 32 --max-model-len 1024 --max-num-seqs 8 \
   --max-num-batched-tokens 8192 --long-prefill-token-threshold 128 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":0}' \

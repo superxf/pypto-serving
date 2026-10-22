@@ -6,13 +6,13 @@ This page describes the DSpark runner and kernel contracts. For checkpoint prepa
 
 | Layer | Interface and responsibility |
 | --- | --- |
-| CLI | `cli/main.py` selects `PyptoDeepSeekV4DSparkExecutor` in `_executor_cls_for_model_family`, validates TP4/EP topology in `_validate_dspark_topology`, and builds seven cache groups in `_build_runtime_config`. |
+| CLI | `cli/main.py` selects `PyptoDeepSeekV4DSparkExecutor` in `_executor_cls_for_model_family`, validates TP1/TP4 topology in `_validate_dspark_topology`, and builds seven cache groups in `_build_runtime_config`. |
 | Executor | `model/deepseek_dspark/npu_executor.py`: `DeepSeekV4DSparkPyptoExecutor._compile_model()` imports and compiles the DSpark prefill/decode programs; `_create_runner()` constructs the runner. |
 | Runner | `model/deepseek_dspark/npu_runner.py`: `DSparkModelRunner.init_kv_cache()` allocates post-weight pools; `prepare_prefill_inputs()` and `prepare_decode_inputs()` lower scheduler batches into the frozen kernel ABI. |
 | Worker | `serving/server/serving_worker.py`: `_make_prefill_batch()` and `_make_decode_batch()` pass group block IDs and cache partitions; `_batch_prefill()` calls `finalize_prefill()` for terminal chunks. |
 | Weights | `model/deepseek_dspark/weight_loader.py`: `DSparkWeightStore` packs target slabs and, for K=7, the three-layer drafter bank. |
 
-The CLI accepts two or four TP4 groups (`--ep 8` or `16`, with `--dp 2` or `4`). The 16-rank deployment discussed below has four scheduler cache partitions. Physical block IDs are local to each partition and replicated across its four TP ranks.
+The CLI accepts two or four TP4 groups (`--ep 8` or `16`, with `--dp 2` or `4`) or sixteen TP1 groups (`--ep 16 --dp 16`). Each target rank owns at most 16 decode requests; the LM head uses TP4 independently. Physical block IDs are local to each scheduler partition and replicated across its target TP ranks.
 
 ## Prefix caching
 
@@ -66,9 +66,9 @@ calls `finalize_prefill()` for terminal chunks so a K=7 request has drafter
 state before decode. These interfaces are the handoff points to inspect when
 changing the kernel ABI.
 
-- **Cache partitions = TP groups.** The scheduler sees 4 partitions. Every
-  rank of a group holds an identical replicated pool: prefill writes the same
-  rows on all four ranks, and decode rebuilds the group's whole KV stream
+- **Cache partitions = TP groups.** The scheduler sees `EP / TP` partitions
+  (16 with TP1/EP16). Every rank of a group holds an identical replicated
+  pool: prefill writes the same rows on all target TP ranks, and decode rebuilds the group's whole KV stream
   from the gathered token rows each step (pypto-lib#1079).
 - **Long-context capacity is logical, not fully resident.** Ratio-128 history
   grows to 8192 single-row pages per request at 1M; ratio-4 and index
@@ -83,21 +83,20 @@ changing the kernel ABI.
   surfaces as an opaque AICore 507901; the depths therefore track the kernel
   constants (`IDX_MAX_BLOCKS`, `CMP_MAX_BLOCKS`,
   `COMPRESS_STATE_MAX_BLOCKS`), never the serving context ceiling.
-- **Prefill** can pack multiple requests per TP group, within 64 requests and
-  8192 total chunk tokens per group (256 requests per dispatch across four
-  groups). These
+- **Prefill** can pack multiple requests per TP group, within 16 requests per
+  rank and 8192 total chunk tokens per group (256 requests per dispatch on
+  16 devices). These
   are admission capacities, not a claim that every occupancy is hardware
   validated. The worker splits dispatches at either limit; configured
   `--max-num-seqs`, token budgets, and available cache can impose lower limits.
   Request boundaries use `query_start_loc`; each request has separate block
   tables, absolute positions, and a last-token output row on the group leader.
   The physical token extent is the largest packed group length rounded up to
-  TP4 alignment, not the per-request context limit. Padding has zero inputs,
+  target TP alignment, not the per-request context limit. Padding has zero inputs,
   synthetic positions, and `-1` cache mappings. Request metadata backing
   capacity follows `--max-num-seqs` within the kernel limits: the global
-  request capacity is `min(max_num_seqs, 256)` and each group's metadata
-  capacity is `min(max_num_seqs, 64)`. The per-group capacity is not divided
-  by four, so uneven groups can share a dispatch. Worker admission follows
+  request capacity is `min(max_num_seqs, 256)` on 16 devices and each group's
+  metadata capacity is `min(max_num_seqs, 16 * TP)`. Worker admission follows
   these compiled capacities; dispatch descriptors bind
   only the live request-axis extent, with repeated terminal boundaries for
   groups containing fewer requests.

@@ -153,18 +153,15 @@ def test_generate_config_defaults_to_greedy(options):
     assert config.temperature == 0.0
 
 
-def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
-    # The DSpark serving topology is TP4 with expert parallelism spanning the
-    # whole world: --ep is the rank count (16 in production, 8 on a half
-    # node) and --dp is the derived scheduler-partition count.
-    for dp, ep in ((2, 8), (4, 16)):
+def test_dspark_topology_accepts_supported_worlds():
+    for tp, dp, ep in ((4, 2, 8), (4, 4, 16), (1, 16, 16)):
         devices = ",".join(str(device) for device in range(ep))
         args = _parse_cli_args(
             [
                 "--model", "model",
                 "--dp", str(dp),
                 "--ep", str(ep),
-                "--tp", "4",
+                "--tp", str(tp),
                 "--devices", devices,
                 "--block-size", "32",
                 "--max-num-seqs", "8",
@@ -173,6 +170,30 @@ def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
         )
 
         cli._validate_dspark_topology(args)
+
+
+def test_dspark_tp1_config_uses_sixteen_cache_partitions(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v4","num_hidden_layers":43}')
+    args = _parse_cli_args(
+        [
+            "--model", str(model_dir),
+            "--devices", ",".join(str(rank) for rank in range(16)),
+            "--dp", "16", "--ep", "16", "--tp", "1",
+            "--block-size", "32",
+            "--max-model-len", "1024",
+            "--max-num-seqs", "8",
+            "--speculative-config", '{"method":"dspark","num_speculative_tokens":0}',
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+    assert config.executor_cls == "PyptoDeepSeekV4DSparkExecutor"
+    assert config.executor_kwargs["tp_size"] == 1
+    assert config.executor_kwargs["cache_ranks"] == 16
+    assert config.parallel_config.num_replicas == 1
+    assert {group.num_partitions for group in config.runtime_config.kv_cache_groups} == {16}
 
 
 @pytest.mark.parametrize("requested", [None, "", "diagnostic-output"])

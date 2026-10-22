@@ -9,19 +9,15 @@
 """Runner for the DSpark DeepSeek-V4-Flash target kernels.
 
 Serves ``l3_prefill_fwd`` and ``l3_decode_fwd`` from
-``pypto-lib/models/deepseek_v4_flash_dspark`` on the canonical 16-card
-TP4/DP4/EP16 topology:
+``pypto-lib/models/deepseek_v4_flash_dspark`` on TP4/DP4/EP16 or
+TP1/DP16/EP16 (and TP4/DP2/EP8):
 
-* The 16 NPU ranks form 4 TP groups.  One group owns packed requests' prefill
-  (all 4 ranks share the packed stream through context-parallel attention) and up
-  to 64 requests' decode (each rank owns 16 requests' 8-row query tiles while
-  the group's whole 512-row token stream is gathered to every rank).
-* Cache pools are scheduler-visible as 4 partitions -- one per TP group --
-  because the group's four ranks hold identical replicated caches that the
-  decode kernels rebuild from the shared token stream every step.
+* Each rank owns 16 requests' decode (128 MoE token rows). A TP group owns
+  16*TP requests; the kernel keeps its 64-request backing tables at every TP.
+* Cache pools have one scheduler-visible partition per target TP group.
 * Both dispatch classes run their kernel-validated physical extents. Prefill
-  pads each packed group only to its TP4 alignment; decode stages 16 requests
-  per rank / 64 per TP group and fills inactive rows with noise tokens plus
+  pads each packed group to its target TP alignment; decode stages 16 requests
+  per rank and fills inactive rows with noise tokens plus
   scratch cache metadata.
 """
 
@@ -338,7 +334,7 @@ DSPARK_C4_STATE_PAGE_TOKENS = 2
 
 # ---- decode tile (fixed at the device-validated shape) ----
 DSPARK_DECODE_SEQ = 8
-DSPARK_DECODE_BATCH = 64  # requests per TP group
+DSPARK_DECODE_BATCH = 64  # fixed physical group-table backing
 DSPARK_DECODE_LOCAL_BATCH = DSPARK_DECODE_BATCH // DSPARK_TP_SIZE
 DSPARK_DECODE_TOKENS = DSPARK_DECODE_BATCH * DSPARK_DECODE_SEQ
 DSPARK_DECODE_LOCAL_TOKENS = DSPARK_DECODE_LOCAL_BATCH * DSPARK_DECODE_SEQ
@@ -515,7 +511,7 @@ def build_dspark_cache_group_specs(
     """Describe the seven DSpark cache families as scheduler-visible groups.
 
     ``partitions`` is the TP-group count (one per scheduler cache partition),
-    not the rank count: the four ranks of one group hold identical replicated
+    not the rank count: the target TP ranks of one group hold identical replicated
     pools, so a block allocated in partition g exists -- with the same id -- on
     every rank of group g.
     """
@@ -684,26 +680,34 @@ class DSparkCacheLayout:
     prefill_batch: int = DSPARK_PREFILL_MAX_BATCH
     prefill_requests: int = DSPARK_PREFILL_MAX_REQUESTS
 
-    @classmethod
-    def for_ranks(cls, ranks: int) -> "DSparkCacheLayout":
-        """Build the layout for one TP4 world of ``ranks`` ranks (8 or 16).
+    @property
+    def bootstrap_context_rows(self) -> int:
+        return DSPARK_SLIDING_WINDOW * DSPARK_DRAFTER_BATCHES[0] // self.tp_size
 
-        Only the rank-derived axes move: the scheduler cache partitions
-        (one per TP group) and the global packed-prefill request capacity that
-        is one ``DSPARK_DECODE_BATCH`` per partition. Every per-group extent
-        (decode batch, dispatch tokens, metadata table depths) is
-        world-size-invariant.
+    @classmethod
+    def for_ranks(cls, ranks: int, *, tp_size: int = DSPARK_TP_SIZE) -> "DSparkCacheLayout":
+        """Build the layout for a DSpark world with TP1 or TP4.
+
+        Scheduler partitions count TP groups. Decode's MoE owner extent stays
+        at 128 rows per rank, while local prefill extent follows target TP.
+        LM-head TP stays independent at four ranks.
         """
         ranks = int(ranks)
-        if ranks not in (2 * DSPARK_TP_SIZE, 4 * DSPARK_TP_SIZE):
+        tp_size = int(tp_size)
+        if (tp_size, ranks) not in ((4, 8), (4, 16), (1, 16)):
             raise ValueError(
-                f"DSpark serving supports 8 or 16 ranks (TP4, EP=ranks), got {ranks}"
+                f"DSpark serving supports TP4/EP8, TP4/EP16 or TP1/EP16, got TP{tp_size}/EP{ranks}"
             )
-        partitions = ranks // DSPARK_TP_SIZE
+        partitions = ranks // tp_size
+        local_batch = DSPARK_MOE_TOKENS // DSPARK_DECODE_SEQ
         return cls(
             ranks=ranks,
+            tp_size=tp_size,
             partitions=partitions,
-            prefill_batch=partitions * DSPARK_DECODE_BATCH,
+            decode_local_batch=local_batch,
+            prefill_local_tokens=DSPARK_PREFILL_DISPATCH_TOKENS // tp_size,
+            prefill_batch=ranks * local_batch,
+            prefill_requests=tp_size * local_batch,
         )
 
     def validate_runtime(
@@ -723,11 +727,12 @@ class DSparkCacheLayout:
             )
         if runtime.max_seq_len > config.max_position_embeddings:
             raise ValueError("DSpark max_seq_len exceeds checkpoint max_position_embeddings")
-        global_decode_capacity = self.partitions * self.decode_batch
+        group_capacity = self.tp_size * self.decode_local_batch
+        global_decode_capacity = self.partitions * group_capacity
         if runtime.max_batch_size > global_decode_capacity:
             raise ValueError(
                 f"DSpark decode supports at most {global_decode_capacity} global requests "
-                f"({self.decode_batch} per TP group), got max_batch_size={runtime.max_batch_size}"
+                f"({group_capacity} per TP group), got max_batch_size={runtime.max_batch_size}"
             )
         expected = {
             "hidden_size": DSPARK_HIDDEN_SIZE,
@@ -834,8 +839,8 @@ class DSparkCacheMetadataBuilder:
             ids = tuple(int(block_id) for block_id in block_ids)
             if not ids:
                 raise ValueError(f"ring table row {row} needs at least one allocated block")
-            if any(block_id < 0 for block_id in ids):
-                raise ValueError("ring table block IDs must not be negative")
+            if any(block_id < -1 for block_id in ids):
+                raise ValueError("ring table block IDs must be >= -1")
             buckets.setdefault(len(ids), []).append((row, ids))
         for width, rows in buckets.items():
             repeats, tail = divmod(depth, width)
@@ -1550,7 +1555,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._ensure_l3_shared_buffers(record)
         requested_slots = min(
             self._compute_kv_cache_capacity_slots(runtime),
-            DSPARK_DECODE_BATCH,
+            self._compiled.layout.tp_size * self._compiled.layout.decode_local_batch,
         )
         allocated = self._alloc_kv_cache_with_retry(requested_slots)
         logger.info(
@@ -1755,13 +1760,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     # ------------------------------------------------------------------
     def load_packed_global_weights(self):
         """Load global tensors and shard the LM head across its TP ranks."""
-        from pypto_serving.model.deepseek.npu_runner import (  # noqa: PLC0415
-            DEEPSEEK_V4_LM_HEAD_TP_SIZE,
-        )
-
         if self._global_weights is None:
             loaded = self._compiled.weight_store.load_packed_global_weights(
-                ranks=DEEPSEEK_V4_LM_HEAD_TP_SIZE
+                ranks=DSPARK_LM_HEAD_TP_SIZE
             )
             embed_weight = loaded.embed_weight.to(
                 device="cpu", dtype=torch.bfloat16
@@ -1782,6 +1783,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         compress_ratios = tuple(int(layer.compress_ratio) for layer in self._compiled.layer_plan)
         return self._compiled.weight_store.load_stacked_layer_weights(
             ranks=self._compiled.layout.ranks,
+            tp_size=self._compiled.layout.tp_size,
             n_routed_experts=self._compiled.n_routed_experts,
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
@@ -1818,6 +1820,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         """Load and pack the mtp.0/1/2 drafter banks (speculation only)."""
         return self._compiled.weight_store.load_drafter_weights(
             ranks=self._compiled.layout.ranks,
+            tp_size=self._compiled.layout.tp_size,
             n_routed_experts=self._compiled.n_routed_experts,
         )
 
@@ -2151,7 +2154,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 # One shared buffer per dynamic extent, allocated before the
                 # worker fork like every other host-shared tensor.
                 for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
-                    group_extent = 4 * extent
+                    group_extent = self._compiled.layout.tp_size * extent
                     self._drafter_context_staging[extent] = {
                         "context_group_position_ids": shared_empty(
                             (ranks, group_extent),
@@ -2410,7 +2413,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 ("hidden", (ranks, DSPARK_DRAFTER_LEASES_PER_GROUP, DSPARK_SLIDING_WINDOW,
                             DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
                 ("positions", (ranks, DSPARK_DRAFTER_LEASES_PER_GROUP, DSPARK_SLIDING_WINDOW), torch.int32),
-                ("context", (ranks, DSPARK_DRAFTER_CONTEXT_ROWS, DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
+                ("context", (ranks, self._compiled.layout.bootstrap_context_rows, DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
             ):
                 self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="prefill_state")
         if self._compiled.prefill_publish is not None:
@@ -2424,7 +2427,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.bootstrap_metadata is not None:
             from pypto_serving.model.deepseek_dspark.task_args import bootstrap_metadata_specs
 
-            for name, (shape, dtype) in bootstrap_metadata_specs(self._compiled.layout.ranks).items():
+            for name, (shape, dtype) in bootstrap_metadata_specs(self._compiled.layout).items():
                 self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="bootstrap_meta")
         worker.release_inherited_host_tensor_refs()
 
@@ -2588,7 +2591,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
 
         for name, (shape, dtype) in decode_scratch_specs(
-            self._compiled.layout.ranks
+            self._compiled.layout
         ).items():
             self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="decode")
 
@@ -3585,7 +3588,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._ensure_shared_host_allocation_before_worker("default grammar buffers")
         ranks = self._compiled.layout.ranks
         mask = shared_empty(
-            (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+            (ranks, self._compiled.layout.max_logit_rows, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
             torch.int16,
             name="dspark_default_grammar_mask",
         )
@@ -4253,7 +4256,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 raise RuntimeError("DSpark standalone accept scratch is unavailable")
             target_hidden = self._alloc_zeroed_stacked_tensor(
                 "dspark_target_hidden",
-                (layout.ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_MAIN_HIDDEN_DIM),
+                (layout.ranks, layout.decode_local_tokens, DSPARK_MAIN_HIDDEN_DIM),
                 torch.bfloat16,
                 scope="decode",
             )
@@ -4576,12 +4579,13 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"DSpark decode cache partitions must be in [0, {layout.partitions - 1}]"
             )
         requests_by_group: list[list[int]] = [[] for _ in range(layout.partitions)]
+        group_capacity = layout.tp_size * layout.decode_local_batch
         for request_index, group in enumerate(groups):
             ordinal = len(requests_by_group[group])
-            if ordinal >= layout.decode_batch:
+            if ordinal >= group_capacity:
                 raise ValueError(
                     f"DSpark TP group {group} decode batch exceeds local capacity "
-                    f"{layout.decode_batch}"
+                    f"{group_capacity}"
                 )
             requests_by_group[group].append(request_index)
         # The fused decode graph is validated at its fixed physical tile. In
@@ -4649,7 +4653,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         layout = self._compiled.layout
         assignment = self._decode_assignment(batch)
         actual_batch = len(batch.request_ids)
-        group_batch = layout.decode_local_batch * layout.tp_size
+        group_batch = layout.decode_batch
         builder = self.cache_metadata
         scratch = self._scratch_blocks()
         request_blocks = tuple(
@@ -5099,7 +5103,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         task_args = self._decode_task_args[buffer_slot]
         local_batch = layout.decode_local_batch
         staged = task_args.tensors
-        group_batch = local_batch * layout.tp_size
+        group_batch = layout.decode_batch
         local_tokens = local_batch * layout.decode_seq
         builder = self.cache_metadata
         rope = self._require_rope_tables()
@@ -5764,7 +5768,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         (zero rows for padding and fillers); every rank's real row count must
         stay within the uniform padded batch.  Context rows end at each
         request's anchor; the group assembly replicates every group row's slot
-        on all four ranks of the group (the drafter's KV-replica contract).
+        on all target TP ranks of the group (the drafter's KV-replica contract).
         Returns ``(batch, context_rows)`` for the dispatch-args slicing.
         """
         if self._drafter_task_args is None or self._markov_task_args is None:
@@ -5934,7 +5938,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             tensors["query_group_position_ids"][rank] = (
                 query_positions_local[group_slice].reshape(-1).to(torch.int32)
             )
-            # Group slots keep the layer axis first: [layers, 4 * rows].
+            # Group slots keep the layer axis first: [layers, TP * rows].
             context_staging["context_group_slot_mapping"][rank, :, :group_context] = (
                 group_slots
             )
@@ -6305,7 +6309,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         batch = self._prepare_device_bootstrap(request_ids)
         metadata = {
             name: self._device_scratch[("bootstrap_meta", name)]
-            for name in bootstrap_metadata_specs(self._compiled.layout.ranks)
+            for name in bootstrap_metadata_specs(self._compiled.layout)
         }
         rope = self._materialize_dspark_rope_tables()
         self._run_l3(
@@ -6314,8 +6318,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._materialize_dspark_device_state_meta(),
             rope["swa_rope_cos_table"], rope["swa_rope_sin_table"], *metadata.values(),
         )
-        context_rows = DSPARK_SLIDING_WINDOW // self._compiled.layout.tp_size
-        context_rows *= batch
+        context_rows = self._compiled.layout.bootstrap_context_rows
         context = self._device_scratch[("prefill_state", "context")]
         self._run_l3(
             self._compiled.prefill_extract_batched, metadata["tail_selectors"],
@@ -6332,7 +6335,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         from pypto_serving.model.deepseek_dspark.task_args import bootstrap_metadata_specs
 
         batch = self._stage_bootstrap_descriptors(request_ids)
-        context_rows = DSPARK_SLIDING_WINDOW // self._compiled.layout.tp_size * batch
+        context_rows = self._compiled.layout.bootstrap_context_rows
         context = self._device_scratch[("prefill_state", "context")]
         drafter_args = dict(zip(
             self._drafter_task_args.names,
@@ -6344,7 +6347,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         ))
         metadata = {
             name: self._device_scratch[("bootstrap_meta", name)]
-            for name in bootstrap_metadata_specs(self._compiled.layout.ranks)
+            for name in bootstrap_metadata_specs(self._compiled.layout)
         }
         rope = self._materialize_dspark_rope_tables()
         args = {
@@ -6790,7 +6793,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if block_table_staging is None
             else block_table_staging
         )
-        context_staging = self._drafter_context_staging[context_rows]
+        context_staging = (
+            {} if bootstrap and self._compiled.bootstrap_metadata is not None
+            else self._drafter_context_staging[context_rows]
+        )
         bounded: list[Any] = []
         for name, arg in zip(task_args.names, task_args.build(), strict=True):
             if name == "next_prefill_tokens" and bootstrap:
@@ -6860,7 +6866,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             "dspark_target_hidden",
             (
                 self._compiled.layout.ranks,
-                DSPARK_DECODE_LOCAL_TOKENS,
+                self._compiled.layout.decode_local_tokens,
                 DSPARK_MAIN_HIDDEN_DIM,
             ),
             torch.bfloat16,

@@ -68,7 +68,7 @@ __all__ = [
     "dspark_stack_groups",
 ]
 
-# Canonical 16-card topology: TP4/DP4 => EP16.
+# Default target topology; TP1 is selected by the serving layout.
 DSPARK_TP_SIZE = 4
 DSPARK_O_GROUPS = 8
 DSPARK_O_LORA = 1024
@@ -276,9 +276,9 @@ class DSParkShardPolicy:
         return packed.contiguous()
 
 
-def dspark_shard_policy(ranks: int) -> DSParkShardPolicy:
+def dspark_shard_policy(ranks: int, *, tp_size: int = DSPARK_TP_SIZE) -> DSParkShardPolicy:
     """The DSpark rank policy, carrying the diagnostics its users recognise."""
-    return DSParkShardPolicy(ranks=ranks)
+    return DSParkShardPolicy(ranks=ranks, tp_size=tp_size)
 
 
 def dspark_expert_parallel(ranks: int, n_routed_experts: int):
