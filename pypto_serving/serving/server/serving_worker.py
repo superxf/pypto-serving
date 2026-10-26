@@ -106,6 +106,14 @@ class _CompletedStepOutput:
 
 
 @dataclass(frozen=True)
+class _DeferredRequestRelease:
+    step_id: int
+    request_ids: list[str]
+    expected_cache_entries: dict[str, object]
+    completed: threading.Event
+
+
+@dataclass(frozen=True)
 class _DecodeCommandFailure:
     """Malformed input forwarded through the ordered device/output lanes."""
 
@@ -297,9 +305,10 @@ class WorkerProcess:
         Prefill and lifecycle-heavy restart commands retain the serial fallback.
         """
         work_queue: queue.Queue[
-            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+            tuple[object, _PreparedDecodeWork | None, dict[str, object], _DeferredRequestRelease | None]
         ] = queue.Queue(maxsize=_DECODE_PIPELINE_SLOTS)
         output_work_queue: queue.Queue[object] = queue.Queue()
+        deferred_releases: list[_DeferredRequestRelease] = []
         slot_ownership = [threading.Semaphore(1) for _ in range(_DECODE_PIPELINE_SLOTS)]
         self._pending_decode_condition = threading.Condition()
         self._pending_decode_request_counts: dict[str, int] = {}
@@ -321,7 +330,7 @@ class WorkerProcess:
                 try:
                     raw: bytes = self.input_queue.get()
                 except Exception:
-                    work_queue.put((ShutdownCommand(), None, {}))
+                    work_queue.put((ShutdownCommand(), None, {}, None))
                     break
                 try:
                     cmd = decode_command(raw)
@@ -334,19 +343,49 @@ class WorkerProcess:
                             ),
                             None,
                             {},
+                            None,
                         )
                     )
                     continue
                 release_cache_entries: dict[str, object] = {}
+                deferred_release = None
                 if isinstance(cmd, StepCommand):
-                    # Snapshot the entries this command intends to release before
-                    # publishing newer registrations. Lifecycle release remains
-                    # on the FIFO device lane; the snapshots prevent it from
-                    # deleting a later registration that reused the same ID.
+                    affected_ids = (
+                        {item.request_id for item in cmd.new_requests}
+                        | {item.request_id for item in cmd.prefill_requests}
+                        | {item.request_id for item in cmd.decode_requests}
+                        | set(cmd.finished_request_ids)
+                    )
+                    if cmd.new_requests or cmd.prefill_requests:
+                        pending = deferred_releases
+                    else:
+                        pending = [release for release in deferred_releases
+                                   if affected_ids.intersection(release.request_ids)]
+                    for release in pending:
+                        release.completed.wait()
+                    deferred_releases = [release for release in deferred_releases
+                                         if not release.completed.is_set()]
+                    # Snapshot releases before newer registrations become visible.
+                    # Deferred cleanup uses these identities to preserve reuse.
                     release_cache_entries = {
                         request_id: self._req_cache.get(request_id, _MISSING_REQUEST)
                         for request_id in cmd.finished_request_ids
                     }
+                    if (
+                        cmd.decode_requests and cmd.finished_request_ids
+                        and not cmd.new_requests and not cmd.prefill_requests
+                        and not {item.request_id for item in cmd.decode_requests}.intersection(
+                            cmd.finished_request_ids
+                        )
+                        and getattr(self.executor, "supports_async_decode_reclaim", False)
+                    ):
+                        deferred_release = _DeferredRequestRelease(
+                            step_id=cmd.step_id,
+                            request_ids=cmd.finished_request_ids,
+                            expected_cache_entries=release_cache_entries,
+                            completed=threading.Event(),
+                        )
+                        deferred_releases.append(deferred_release)
                     for new_request in cmd.new_requests:
                         self._req_cache[new_request.request_id] = new_request
                 owned_slot = None
@@ -377,7 +416,7 @@ class WorkerProcess:
                         batch=None,
                         error=str(exc),
                     )
-                work_queue.put((cmd, prepared, release_cache_entries))
+                work_queue.put((cmd, prepared, release_cache_entries, deferred_release))
                 if isinstance(cmd, ShutdownCommand):
                     break
         finally:
@@ -387,13 +426,13 @@ class WorkerProcess:
     def _device_execution_loop(
         self,
         work_queue: queue.Queue[
-            tuple[object, _PreparedDecodeWork | None, dict[str, object]]
+            tuple[object, _PreparedDecodeWork | None, dict[str, object], _DeferredRequestRelease | None]
         ],
         output_work_queue: queue.Queue[object],
     ) -> None:
         """Dispatch FIFO device work without reclaiming host outputs."""
         while True:
-            cmd, prepared, release_cache_entries = work_queue.get()
+            cmd, prepared, release_cache_entries, deferred_release = work_queue.get()
             if isinstance(cmd, ShutdownCommand):
                 output_work_queue.put(cmd)
                 return
@@ -406,8 +445,14 @@ class WorkerProcess:
                 barrier.completed.wait()
                 continue
             assert isinstance(cmd, StepCommand)
+            if deferred_release is not None:
+                output_work_queue.put(deferred_release)
             try:
-                self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+                if deferred_release is None:
+                    with profile_span("WorkerProcess.wait_finished_reclaim", cat="worker",
+                                      args={"step_id": cmd.step_id,
+                                            "count": len(cmd.finished_request_ids)}):
+                        self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 accepted_lengths = getattr(self, "_accepted_output_lengths", {})
                 # Both grammar and stop-token masks depend on committed output.
                 self._wait_for_pending_decode_reclaims(
@@ -422,8 +467,11 @@ class WorkerProcess:
                              ))
                     ]
                 )
-                self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
-                self._apply_command_lifecycle(cmd, release_cache_entries)
+                if deferred_release is None:
+                    self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
+                self._apply_command_lifecycle(
+                    cmd, release_cache_entries, release_finished=deferred_release is None
+                )
             except Exception as exc:
                 logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
                 output_work_queue.put(
@@ -522,10 +570,26 @@ class WorkerProcess:
         slot_ownership: list[threading.Semaphore],
     ) -> None:
         """Reclaim completed outputs and publish StepResults in dispatch order."""
+        deferred_errors: dict[int, str] = {}
         while True:
             work = output_work_queue.get()
             if isinstance(work, ShutdownCommand):
                 return
+            if isinstance(work, _DeferredRequestRelease):
+                try:
+                    with profile_span("WorkerProcess.release_finished", cat="worker",
+                                      args={"step_id": work.step_id,
+                                            "count": len(work.request_ids)}):
+                        self._release_finished_request_state(
+                            work.request_ids,
+                            expected_cache_entries=work.expected_cache_entries,
+                        )
+                except Exception as exc:
+                    logger.error("Worker deferred request release failed: %s", exc, exc_info=True)
+                    deferred_errors[work.step_id] = str(exc)
+                finally:
+                    work.completed.set()
+                continue
             if isinstance(work, _ProfileBarrier):
                 try:
                     self._handle_profile_command(work.command)
@@ -549,6 +613,13 @@ class WorkerProcess:
                 buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
+            if result.step_id in deferred_errors:
+                release_error = deferred_errors.pop(result.step_id)
+                error = (
+                    f"{result.error}; deferred release failed: {release_error}"
+                    if result.error else release_error
+                )
+                result = StepResult(new_tokens={}, error=error, step_id=result.step_id)
             if buffer_slot is not None:
                 slot_ownership[buffer_slot].release()
             self.output_queue.put(encode_result(result))
@@ -757,16 +828,19 @@ class WorkerProcess:
         self,
         cmd: StepCommand,
         expected_cache_entries: dict[str, object] | None = None,
+        *,
+        release_finished: bool = True,
     ) -> None:
         """Apply request release and registration on the FIFO device lane."""
         if not hasattr(self, "_constraint_states"):
             self._constraint_states = {}
         if not hasattr(self, "_accepted_output_lengths"):
             self._accepted_output_lengths = {}
-        self._release_finished_request_state(
-            cmd.finished_request_ids,
-            expected_cache_entries=expected_cache_entries,
-        )
+        if release_finished:
+            self._release_finished_request_state(
+                cmd.finished_request_ids,
+                expected_cache_entries=expected_cache_entries,
+            )
         for new_request in cmd.new_requests:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:

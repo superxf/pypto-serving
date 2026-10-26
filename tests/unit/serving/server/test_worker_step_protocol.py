@@ -495,6 +495,114 @@ def test_worker_does_not_prepare_prefill_asynchronously():
     assert worker._prepare_step_command(command) is None
 
 
+def test_finished_request_release_does_not_block_unrelated_decode():
+    old_reclaim_started = threading.Event()
+    allow_old_reclaim = threading.Event()
+    live_dispatched = threading.Event()
+    release_started = threading.Event()
+    allow_release = threading.Event()
+    released: list[str] = []
+
+    class Executor:
+        supports_async_decode_prepare = True
+        supports_async_decode_reclaim = True
+        supports_device_decode_embedding = True
+
+        @staticmethod
+        def dispatch_prepared_decode(_model, batch, _prepared):
+            if batch.request_ids == ["live"]:
+                live_dispatched.set()
+            return batch.request_ids[0]
+
+        @staticmethod
+        def reclaim_prepared_decode(request_id):
+            if request_id == "old":
+                old_reclaim_started.set()
+                assert allow_old_reclaim.wait(timeout=5)
+            return object()
+
+        @staticmethod
+        def release_finished_requests(request_ids):
+            release_started.set()
+            assert allow_release.wait(timeout=5)
+            released.extend(request_ids)
+
+    input_queue: Queue = Queue()
+    output_queue: Queue = Queue()
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
+    worker.input_queue = input_queue
+    worker.output_queue = output_queue
+    worker.executor = Executor()
+    worker.sampler = None
+    worker.model_record = SimpleNamespace(runtime_model=object())
+    old = NewRequestData("old", [1], 0.0, 1.0, None)
+    replacement = NewRequestData("old", [2], 0.0, 1.0, None)
+    worker._req_cache = {"old": old, "live": NewRequestData("live", [3], 0.0, 1.0, None)}
+    worker._last_tokens = {}
+    worker._prepare_step_command = lambda cmd, buffer_slot: serving_worker._PreparedDecodeWork(
+        prepared=object(), buffer_slot=buffer_slot,
+        batch=SimpleNamespace(request_ids=[item.request_id for item in cmd.decode_requests]),
+    ) if cmd.decode_requests else None
+    worker._late_bind_prepared_decode_batch = lambda prepared, _scheduled: prepared.batch
+    worker._consume_decode_result = lambda scheduled, _result, tokens, batch: (
+        tokens.update({item.request_id: [1] for item in scheduled}) or {}
+    )
+    worker._execute_step = lambda cmd, prepared_decode=None: StepResult(step_id=cmd.step_id)
+
+    def command(step_id, *, decode=(), finished=(), new=()):
+        return StepCommand(
+            new_requests=list(new), prefill_requests=[],
+            decode_requests=[DecodeRequest(request_id, -1, 2, []) for request_id in decode],
+            finished_request_ids=list(finished), step_id=step_id,
+        )
+
+    thread = threading.Thread(target=worker.busy_loop)
+    thread.start()
+    try:
+        input_queue.put(encode_command(command(1, decode=("old",))))
+        assert old_reclaim_started.wait(timeout=5)
+        input_queue.put(encode_command(command(2, decode=("live",), finished=("old",))))
+        assert live_dispatched.wait(timeout=5)
+        assert released == []
+        input_queue.put(encode_command(command(3, new=(replacement,))))
+        allow_old_reclaim.set()
+        assert release_started.wait(timeout=5)
+        assert worker._req_cache["old"] is old
+        allow_release.set()
+        assert [decode_result(output_queue.get(timeout=5)).step_id for _ in range(3)] == [1, 2, 3]
+        assert released == ["old"]
+        assert worker._req_cache["old"].prompt_token_ids == [2]
+    finally:
+        allow_old_reclaim.set()
+        allow_release.set()
+        input_queue.put(encode_command(ShutdownCommand()))
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_deferred_release_error_is_reported_on_its_step():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.output_queue = Queue()
+
+    def fail_release(*_args, **_kwargs):
+        raise RuntimeError("release failed")
+
+    worker._release_finished_request_state = fail_release
+    completed = threading.Event()
+    work_queue: Queue = Queue()
+    work_queue.put(serving_worker._DeferredRequestRelease(2, ["old"], {}, completed))
+    work_queue.put(serving_worker._CompletedStepOutput(StepResult(new_tokens={}, step_id=2)))
+    work_queue.put(ShutdownCommand())
+
+    worker._output_reclaim_loop(work_queue, [])
+
+    assert completed.is_set()
+    result = decode_result(worker.output_queue.get_nowait())
+    assert result.step_id == 2
+    assert result.error == "release failed"
+
+
 def test_constrained_dispatch_binds_live_state_after_early_prepare():
     from pypto_serving.config.types import DecodeBatch
 
@@ -533,7 +641,7 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
 
 def test_worker_routes_decode_failures_through_device_fifo():
     worker = WorkerProcess.__new__(WorkerProcess)
-    worker._apply_command_lifecycle = lambda _cmd, _entries: None
+    worker._apply_command_lifecycle = lambda _cmd, _entries, **_kwargs: None
     worker._can_split_decode_output = lambda _cmd, _prepared: False
     worker._execute_step = lambda cmd, prepared_decode=None: StepResult(step_id=cmd.step_id)
     work_queue: Queue = Queue()
@@ -545,7 +653,7 @@ def test_worker_routes_decode_failures_through_device_fifo():
         finished_request_ids=[],
         step_id=7,
     )
-    work_queue.put((command, None, {}))
+    work_queue.put((command, None, {}, None))
     work_queue.put(
         (
             serving_worker._DecodeCommandFailure(
@@ -553,9 +661,10 @@ def test_worker_routes_decode_failures_through_device_fifo():
             ),
             None,
             {},
+            None,
         )
     )
-    work_queue.put((ShutdownCommand(), None, {}))
+    work_queue.put((ShutdownCommand(), None, {}, None))
 
     worker._device_execution_loop(work_queue, output_work_queue)
 
